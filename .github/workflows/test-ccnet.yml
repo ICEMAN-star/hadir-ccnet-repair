@@ -32,119 +32,334 @@ jobs:
           python -m pip install --upgrade pip
           pip install onnx onnxruntime numpy
 
-      - name: Extract and test model
+      - name: Extract and Diagnose CCNet
         run: |
-          cat > test_model.py <<'PY'
+          cat > diagnose_ccnet.py <<'PY'
           import os
+          import sys
           import zipfile
           import hashlib
           import traceback
 
-          report = []
+          REPORT = []
 
-          def log(message):
-              print(message)
-              report.append(str(message))
+          def log(message=""):
+              message = str(message)
+              print(message, flush=True)
+              REPORT.append(message)
 
-          try:
+          def save_report():
+              with open("test-report.txt", "w", encoding="utf-8") as f:
+                  f.write("\n".join(REPORT))
+
+          def sha256_file(path):
+              digest = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def main():
               zip_path = "model/palm_ccnet_fp16_repaired_candidate.zip"
 
-              log("=== ZIP FILE ===")
-              log("Size: " + str(os.path.getsize(zip_path)))
-              with open(zip_path, "rb") as f:
-                  log("ZIP SHA256: " + hashlib.sha256(f.read()).hexdigest())
+              if not os.path.isfile(zip_path):
+                  raise FileNotFoundError(
+                      "Release ZIP not found: " + zip_path
+                  )
 
-              with zipfile.ZipFile(zip_path) as z:
+              log("================================")
+              log("CCNET MODEL DIAGNOSTIC")
+              log("================================")
+
+              log("\n=== ZIP INFORMATION ===")
+              log("ZIP size: " + str(os.path.getsize(zip_path)))
+              log("ZIP SHA256: " + sha256_file(zip_path))
+
+              with zipfile.ZipFile(zip_path, "r") as archive:
+                  bad_file = archive.testzip()
+
+                  if bad_file:
+                      raise Exception(
+                          "ZIP integrity error in: " + bad_file
+                      )
+
                   onnx_files = [
-                      n for n in z.namelist()
-                      if n.lower().endswith(".onnx")
-                      and not n.startswith("/")
-                      and ".." not in n.split("/")
+                      item for item in archive.infolist()
+                      if item.filename.lower().endswith(".onnx")
+                      and not item.is_dir()
+                      and not item.filename.startswith("/")
+                      and ".." not in item.filename.split("/")
                   ]
 
                   if not onnx_files:
                       raise Exception("No ONNX file found inside ZIP")
 
-                  log("ONNX files found: " + str(onnx_files))
+                  log("ZIP integrity: PASSED")
+                  log("ONNX files found:")
+
+                  for item in onnx_files:
+                      log(
+                          item.filename
+                          + " | "
+                          + str(item.file_size)
+                          + " bytes"
+                      )
 
                   selected = max(
                       onnx_files,
-                      key=lambda n: z.getinfo(n).file_size
+                      key=lambda item: item.file_size
                   )
 
                   os.makedirs("model/extracted", exist_ok=True)
+
                   model_path = "model/extracted/model.onnx"
 
-                  with z.open(selected) as src, open(model_path, "wb") as dst:
-                      while True:
-                          chunk = src.read(1024 * 1024)
-                          if not chunk:
-                              break
-                          dst.write(chunk)
+                  with archive.open(selected) as source:
+                      with open(model_path, "wb") as destination:
+                          while True:
+                              chunk = source.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              destination.write(chunk)
 
-              log("=== MODEL FILE ===")
+              log("\n=== MODEL INFORMATION ===")
+              log("Selected file: " + selected.filename)
               log("Model size: " + str(os.path.getsize(model_path)))
-
-              with open(model_path, "rb") as f:
-                  log("Model SHA256: " + hashlib.sha256(f.read()).hexdigest())
+              log("Model SHA256: " + sha256_file(model_path))
 
               import onnx
               import onnxruntime as ort
 
-              log("=== ONNX CHECKER ===")
-              model = onnx.load(model_path, load_external_data=True)
-              onnx.checker.check_model(model)
-              log("ONNX_CHECKER: PASSED")
+              log("\n=== ONNX STRUCTURE ===")
 
-              log("=== ONNX RUNTIME ===")
-              session = ort.InferenceSession(
-                  model_path,
-                  providers=["CPUExecutionProvider"]
+              model = None
+              checker_passed = False
+
+              try:
+                  model = onnx.load(
+                      model_path,
+                      load_external_data=True
+                  )
+
+                  onnx.checker.check_model(model)
+
+                  checker_passed = True
+                  log("ONNX_CHECKER: PASSED")
+
+              except Exception:
+                  log("ONNX_CHECKER: FAILED")
+                  log(traceback.format_exc())
+
+                  if model is None:
+                      try:
+                          model = onnx.load(
+                              model_path,
+                              load_external_data=False
+                          )
+                      except Exception:
+                          log("Could not parse ONNX graph")
+                          log(traceback.format_exc())
+
+              if model is not None:
+                  graph = model.graph
+
+                  log("\n=== GRAPH SUMMARY ===")
+                  log("IR version: " + str(model.ir_version))
+                  log(
+                      "Opsets: "
+                      + str([
+                          (x.domain, x.version)
+                          for x in model.opset_import
+                      ])
+                  )
+                  log("Node count: " + str(len(graph.node)))
+                  log("Graph inputs: " + str(len(graph.input)))
+                  log("Graph outputs: " + str(len(graph.output)))
+                  log("Initializers: " + str(len(graph.initializer)))
+
+                  graph_inputs = {
+                      item.name for item in graph.input
+                  }
+
+                  initializers = {
+                      item.name for item in graph.initializer
+                  }
+
+                  producers = {}
+
+                  for index, node in enumerate(graph.node):
+                      for output in node.output:
+                          if output:
+                              producers[output] = (index, node)
+
+                  target = "onnx::Add_677"
+
+                  log("\n=== TARGET DIAGNOSIS ===")
+                  log("Target: " + target)
+                  log("Graph input: " + str(target in graph_inputs))
+                  log("Initializer: " + str(target in initializers))
+                  log("Has producer: " + str(target in producers))
+
+                  if target in producers:
+                      index, node = producers[target]
+                      log("Producer index: " + str(index))
+                      log("Producer name: " + node.name)
+                      log("Producer operation: " + node.op_type)
+
+                  log("\n=== RELATED NODES ===")
+
+                  related_found = False
+
+                  for index, node in enumerate(graph.node):
+                      if (
+                          target in node.input
+                          or target in node.output
+                      ):
+                          related_found = True
+
+                          log("\nNode index: " + str(index))
+                          log("Name: " + node.name)
+                          log("Operation: " + node.op_type)
+                          log("Inputs: " + str(list(node.input)))
+                          log("Outputs: " + str(list(node.output)))
+
+                          start = max(0, index - 3)
+                          end = min(len(graph.node), index + 4)
+
+                          log("Nearby nodes:")
+
+                          for j in range(start, end):
+                              nearby = graph.node[j]
+
+                              log(
+                                  str(j)
+                                  + " | "
+                                  + nearby.name
+                                  + " | "
+                                  + nearby.op_type
+                              )
+
+                              log(
+                                  "  INPUTS: "
+                                  + str(list(nearby.input))
+                              )
+
+                              log(
+                                  "  OUTPUTS: "
+                                  + str(list(nearby.output))
+                              )
+
+                  if not related_found:
+                      log("No direct node reference found")
+
+                  log("\n=== ALL UNRESOLVED INPUTS ===")
+
+                  known = (
+                      graph_inputs
+                      | initializers
+                      | set(producers.keys())
+                  )
+
+                  missing = set()
+
+                  for node in graph.node:
+                      for name in node.input:
+                          if name and name not in known:
+                              missing.add(name)
+
+                  log("Missing input count: " + str(len(missing)))
+
+                  for name in sorted(missing):
+                      log("MISSING: " + name)
+
+                  log("\n=== GRAPH OUTPUTS ===")
+
+                  for output in graph.output:
+                      log(
+                          output.name
+                          + " | "
+                          + str(output.type)
+                      )
+
+              log("\n=== ONNX RUNTIME TEST ===")
+
+              runtime_passed = False
+
+              try:
+                  session = ort.InferenceSession(
+                      model_path,
+                      providers=["CPUExecutionProvider"]
+                  )
+
+                  runtime_passed = True
+                  log("RUNTIME_LOAD: PASSED")
+
+                  log("\nRuntime inputs:")
+
+                  for item in session.get_inputs():
+                      log(
+                          str({
+                              "name": item.name,
+                              "shape": item.shape,
+                              "type": item.type
+                          })
+                      )
+
+                  log("\nRuntime outputs:")
+
+                  for item in session.get_outputs():
+                      log(
+                          str({
+                              "name": item.name,
+                              "shape": item.shape,
+                              "type": item.type
+                          })
+                      )
+
+              except Exception:
+                  log("RUNTIME_LOAD: FAILED")
+                  log(traceback.format_exc())
+
+              log("\n=== FINAL RESULT ===")
+              log("ZIP_EXTRACTION: PASSED")
+              log(
+                  "ONNX_CHECKER: "
+                  + ("PASSED" if checker_passed else "FAILED")
+              )
+              log(
+                  "RUNTIME_LOAD: "
+                  + ("PASSED" if runtime_passed else "FAILED")
               )
 
-              log("RUNTIME_LOAD: PASSED")
+              log(
+                  "\nIMPORTANT: These tests do not measure "
+                  "palm recognition accuracy."
+              )
 
-              log("=== INPUTS ===")
-              for item in session.get_inputs():
-                  log({
-                      "name": item.name,
-                      "shape": item.shape,
-                      "type": item.type
-                  })
+              save_report()
 
-              log("=== OUTPUTS ===")
-              for item in session.get_outputs():
-                  log({
-                      "name": item.name,
-                      "shape": item.shape,
-                      "type": item.type
-                  })
+              if not checker_passed or not runtime_passed:
+                  return 1
 
-              log("=== MODEL METADATA ===")
-              log("IR version: " + str(model.ir_version))
-              log("Opset: " + str([
-                  x.version for x in model.opset_import
-              ]))
-              log("NODE COUNT: " + str(len(model.graph.node)))
+              return 0
 
-              log("FINAL RESULT: STRUCTURE AND RUNTIME LOAD PASSED")
-
+          try:
+              exit_code = main()
           except Exception:
-              log("TEST FAILED:")
+              log("\nFATAL ERROR:")
               log(traceback.format_exc())
-              raise
+              save_report()
+              exit_code = 1
 
-          finally:
-              with open("test-report.txt", "w") as f:
-                  f.write("\n".join(map(str, report)))
+          sys.exit(exit_code)
           PY
 
-          python test_model.py
+          python diagnose_ccnet.py
 
-      - name: Upload test report
+      - name: Upload diagnostic report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ccnet-test-report
+          name: ccnet-diagnostic-report
           path: test-report.txt
           if-no-files-found: ignore
