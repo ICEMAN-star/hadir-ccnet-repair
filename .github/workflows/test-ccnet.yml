@@ -1,0 +1,150 @@
+
+name: Test CCNet ONNX
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-model:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download release ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p model
+          gh release download v1.0 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "palm_ccnet_fp16_repaired_candidate.zip" \
+            --dir model
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ONNX tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install onnx onnxruntime numpy
+
+      - name: Extract and test model
+        run: |
+          cat > test_model.py <<'PY'
+          import os
+          import zipfile
+          import hashlib
+          import traceback
+
+          report = []
+
+          def log(message):
+              print(message)
+              report.append(str(message))
+
+          try:
+              zip_path = "model/palm_ccnet_fp16_repaired_candidate.zip"
+
+              log("=== ZIP FILE ===")
+              log("Size: " + str(os.path.getsize(zip_path)))
+              with open(zip_path, "rb") as f:
+                  log("ZIP SHA256: " + hashlib.sha256(f.read()).hexdigest())
+
+              with zipfile.ZipFile(zip_path) as z:
+                  onnx_files = [
+                      n for n in z.namelist()
+                      if n.lower().endswith(".onnx")
+                      and not n.startswith("/")
+                      and ".." not in n.split("/")
+                  ]
+
+                  if not onnx_files:
+                      raise Exception("No ONNX file found inside ZIP")
+
+                  log("ONNX files found: " + str(onnx_files))
+
+                  selected = max(
+                      onnx_files,
+                      key=lambda n: z.getinfo(n).file_size
+                  )
+
+                  os.makedirs("model/extracted", exist_ok=True)
+                  model_path = "model/extracted/model.onnx"
+
+                  with z.open(selected) as src, open(model_path, "wb") as dst:
+                      while True:
+                          chunk = src.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          dst.write(chunk)
+
+              log("=== MODEL FILE ===")
+              log("Model size: " + str(os.path.getsize(model_path)))
+
+              with open(model_path, "rb") as f:
+                  log("Model SHA256: " + hashlib.sha256(f.read()).hexdigest())
+
+              import onnx
+              import onnxruntime as ort
+
+              log("=== ONNX CHECKER ===")
+              model = onnx.load(model_path, load_external_data=True)
+              onnx.checker.check_model(model)
+              log("ONNX_CHECKER: PASSED")
+
+              log("=== ONNX RUNTIME ===")
+              session = ort.InferenceSession(
+                  model_path,
+                  providers=["CPUExecutionProvider"]
+              )
+
+              log("RUNTIME_LOAD: PASSED")
+
+              log("=== INPUTS ===")
+              for item in session.get_inputs():
+                  log({
+                      "name": item.name,
+                      "shape": item.shape,
+                      "type": item.type
+                  })
+
+              log("=== OUTPUTS ===")
+              for item in session.get_outputs():
+                  log({
+                      "name": item.name,
+                      "shape": item.shape,
+                      "type": item.type
+                  })
+
+              log("=== MODEL METADATA ===")
+              log("IR version: " + str(model.ir_version))
+              log("Opset: " + str([
+                  x.version for x in model.opset_import
+              ]))
+              log("NODE COUNT: " + str(len(model.graph.node)))
+
+              log("FINAL RESULT: STRUCTURE AND RUNTIME LOAD PASSED")
+
+          except Exception:
+              log("TEST FAILED:")
+              log(traceback.format_exc())
+              raise
+
+          finally:
+              with open("test-report.txt", "w") as f:
+                  f.write("\n".join(map(str, report)))
+          PY
+
+          python test_model.py
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccnet-test-report
+          path: test-report.txt
+          if-no-files-found: ignore
